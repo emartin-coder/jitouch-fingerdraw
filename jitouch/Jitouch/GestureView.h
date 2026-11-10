@@ -15,5 +15,6 @@
 - (void)addPointX:(float)x Y:(float)y;
 - (void)addRelativePointX:(float)x Y:(float)y;
 - (void)clear;
+- (void)breakStroke;
 
 @end

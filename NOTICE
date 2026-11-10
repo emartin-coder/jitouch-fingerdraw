@@ -1,0 +1,18 @@
+Jitouch FingerDraw is a modified version of Jitouch (https://github.com/JitouchApp/Jitouch, version 2.82.1).
+
+Jitouch: Copyright (c) Supasorn Suwajanakorn and Sukolsak Sakshuwong.
+Modified work: Copyright (c) Aaron Kollasch.
+FingerDraw modifications: Copyright (c) 2026 emartin-coder. Modified November 2026.
+
+All of it is released under the GNU General Public License, version 3. See LICENSE.
+
+Modified files (November 2026):
+- jitouch/Jitouch/Gesture.m: Magic Mouse fingertip drawing recognizer, multi-stroke letters, personal handwriting
+  matching, scroll and click guards, gesture log.
+- jitouch/Jitouch/GestureView.h, GestureView.m, GestureWindow.h, GestureWindow.m: pen-up between strokes, finger
+  position ring, ink drawn in the mouse surface's proportions.
+- jitouch/Jitouch/JitouchAppDelegate.m: quits if another copy is already running.
+- README.md: rewritten for this fork. .gitignore: excludes personal recordings and build output.
+
+New files (November 2026): jitouch/Jitouch/PDollar.h, PDollar.m ($P point-cloud recognizer, after Vatavu, Anthony
+and Wobbrock, ICMI 2012), build.sh, make-signing-identity.sh, support/, tests/, tools/.

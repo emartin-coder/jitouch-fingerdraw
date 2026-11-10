@@ -177,6 +177,15 @@ void languageChanged(CFNotificationCenterRef center, void *observer, CFStringRef
 */
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
+    // One copy only: the login agent and a Finder double-click can both start the app, and two copies fire every gesture twice.
+    NSArray *running = [NSRunningApplication runningApplicationsWithBundleIdentifier:[[NSBundle mainBundle] bundleIdentifier]];
+    for (NSRunningApplication *app in running) {
+        if (app.processIdentifier != getpid()) {
+            [NSApp terminate:nil];
+            return;
+        }
+    }
+
     [Settings loadSettings];
 
     [self refreshMenu];

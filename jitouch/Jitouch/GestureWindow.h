@@ -15,6 +15,8 @@
 }
 - (void)setHintText:(const char*)str;
 - (void)addPointX:(float)x Y:(float)y;
+- (void)breakStroke;
+- (void)setUpWindowForMouseSurface;
 - (void)addRelativePointX:(float)x Y:(float)y;
 - (void)clear;
 - (void)refresh;

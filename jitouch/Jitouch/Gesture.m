@@ -7,6 +7,9 @@
 //
 
 #import "Gesture.h"
+#import "PDollar.h"
+#include <pthread.h>
+#include <sys/stat.h>
 #import <math.h>
 #import <unistd.h>
 #import <CoreFoundation/CoreFoundation.h>
@@ -174,9 +177,16 @@ static float normIPdf[201];
 static void trackpadRecognizerTwo(const Finger *data, int nFingers, double timestamp);
 static void trackpadRecognizerOne(const Finger *data, int nFingers, double timestamp);
 static int mouseRecognizer(float x, float y, int step);
+static void magicMouseFingerRecognizer(const Finger *data, int nFingers, double timestamp);
 static void initChars(void);
 static void initNormPdf(void);
-static int isTrackpadRecognizing, isMouseRecognizing;
+static int isTrackpadRecognizing, isMouseRecognizing, isMMFingerRecognizing;
+// Set by the event tap: when the system last scrolled (including momentum) and when a mouse button went down.
+// A Magic Mouse click and a scroll flick both start with a touch, so these tell a deliberate tap apart from them.
+static volatile double mmLastScrollWall, mmLastClickWall;
+#ifdef JITOUCH_TEST
+static int jtTestButtonDown; // tests stand in for the physical button
+#endif
 static int cancelRecognition;
 /* Character Recognizer End */
 
@@ -237,6 +247,7 @@ static void turnOffCharacters() {
     [pool release];
     isTrackpadRecognizing = 0;
     isMouseRecognizing = 0;
+    isMMFingerRecognizing = 0;
 }
 
 void turnOffGestures() {
@@ -633,6 +644,10 @@ static NSString* commandForGesture(NSString *gesture, int device) {
 
 
 static void dispatchCommand(NSString *gesture, int device) {
+#ifdef JITOUCH_TEST
+    jtTestRecognized = [gesture copy]; // tests/test_fingerdraw.m records the result instead of running the action
+    return;
+#endif
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
         NSDate *start = [NSDate date];
         doCommand(gesture, device);
@@ -2750,12 +2765,16 @@ static int magicMouseCallback(MTDeviceRef device, Finger *data, int nFingers, do
         }
     }
 
+    // Before the left-handed mirror below, so drawn letters are never flipped.
+    if (enCharRegMM)
+        magicMouseFingerRecognizer(data, nFingers, timestamp);
+
     if (enMMHanded) {
         for (int i = 0; i < nFingers; i++)
             data[i].px = 1 - data[i].px;
     }
 
-    if (!ignore) {
+    if (!ignore && !isMMFingerRecognizing) {
         int thumbPresent = gestureMagicMouseThumb(data, nFingers);
         disableHorizontalScroll = (nFingers > 1);
 
@@ -2945,10 +2964,13 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
 
     if (type == kCGEventLeftMouseDown || type == kCGEventRightMouseDown) {
 
+        mmLastClickWall = CFAbsoluteTimeGetCurrent();
         if (isTrackpadRecognizing) {
             cancelRecognition = 1;
             return NULL;
         }
+        if (isMMFingerRecognizing)
+            cancelRecognition = 1; // a real click means you weren't drawing: cancel, and let the click through
         if (simulating) {   //simulating should be reset when mouseup, but sometimes mouseup doesn't get called
             simulating = 0; //so we have to reset it manually
         }
@@ -3032,7 +3054,9 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
         }
 
     } else if (type == kCGEventScrollWheel) {
-        if (magicMouseThreeFingerFlag || isTrackpadRecognizing)
+        if (!isMMFingerRecognizing)
+            mmLastScrollWall = CFAbsoluteTimeGetCurrent();
+        if (magicMouseThreeFingerFlag || isTrackpadRecognizing || isMMFingerRecognizing)
             return NULL;
         else if (autoScrollFlag) {
             int64_t sc = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1);
@@ -4140,6 +4164,300 @@ static void trackpadRecognizerOne(const Finger *data, int nFingers, double times
             mouseClick(8, 10000, 10000);
         }
     }
+}
+
+// Magic Mouse fingertip drawing: tap once, put the finger back down, draw, lift. Letters can take several strokes:
+// after a lift the recognizer waits strokeGap for another stroke before it reads the letter.
+// One stroke goes to Jitouch's own direction recognizer; two or more go to the $P point-cloud recognizer.
+// Coordinates are the finger's normalized position on the mouse surface (0..1), same as the trackpad path.
+#define MM_MAX_POINTS 2048
+static int mmStep = 0, mmShown = 0, mmStrokes = 0, mmGen = 0, mmNPts = 0;
+static PDPoint mmPts[MM_MAX_POINTS];
+static float mmFirst[2], mmLast[2], mmTop, mmBottom, mmLeft, mmRight; // stroke 1 only, for Jitouch's recognizer
+static const double strokeGap = 0.5;   // recorded multi-stroke F: 0.2-0.38 s between strokes
+static const float pdollarMaxScore = 2.0f; // ponytail: real F (own templates) 0.68-1.07, built-ins 1.4-1.7; raise if real letters read as nothing
+// One-stroke drawings are first matched against your trained handwriting; this is how close a match must be.
+// Calibrated 2026-11-10: your trained letters scored at most 0.85 (leave-one-out); the closest recorded scroll
+// stroke scored 2.32. tests/run.sh re-checks both against your current letters.txt on every build.
+static const float personalMaxScore = 1.5f;
+static const double scrollQuiet = 0.4;      // no system scroll this long before a tap, or it's part of scrolling
+// A lift shorter than mergeGap that lands within mergeDist of where it left is contact loss, not a new stroke.
+// Recorded deliberate re-placements always landed 0.1-0.35 away; slips came back 0.01-0.02 away.
+static const double mergeGap = 0.2;
+static const float mergeDist = 0.04f;
+// One straight line is exactly what a scroll looks like, so on the mouse these never fire (trackpad unaffected).
+static const char *mmScrollLike[] = {"Up", "Down", "Left", "Right", "/ Up", "/ Down", "\\ Up", "\\ Down",
+                                     "Up-Down", "Down-Up", "Left-Right", "Right-Left", NULL};
+
+static int mmButtonDown(void) {
+#ifdef JITOUCH_TEST
+    return jtTestButtonDown;
+#else
+    return CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, kCGMouseButtonLeft) ||
+           CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, kCGMouseButtonRight);
+#endif
+}
+
+// Every stroke straight and pointing along the same axis = a run of scroll flicks, not a letter.
+static int mmParallelFlicks(void) {
+    float ax[64], ay[64];
+    int n = 0;
+    for (int i = 0, j; i < mmNPts && n < 64; i = j) {
+        float path = 0;
+        for (j = i + 1; j < mmNPts && mmPts[j].stroke == mmPts[i].stroke; j++)
+            path += hypotf(mmPts[j].x - mmPts[j - 1].x, mmPts[j].y - mmPts[j - 1].y);
+        float dx = mmPts[j - 1].x - mmPts[i].x, dy = mmPts[j - 1].y - mmPts[i].y, d = hypotf(dx, dy);
+        if (d < 1e-4f) continue;          // a dot, not a stroke
+        if (d < 0.85f * path) return 0;   // a curved stroke: letter-like
+        ax[n] = dx / d; ay[n] = dy / d; n++;
+    }
+    for (int a = 1; a < n; a++)
+        if (fabsf(ax[0] * ax[a] + ay[0] * ay[a]) < 0.9f) return 0; // more than ~25 degrees apart
+    return n > 1;
+}
+
+// Every finished drawing (fired or not) and every refused tap goes to ~/Library/Logs/Jitouch-gestures.log,
+// so a false trigger or a gesture that didn't fire can be diagnosed without recording anything.
+static void mmLogLine(const char *line) {
+#ifndef JITOUCH_TEST
+    const char *path = [[@"~/Library/Logs/Jitouch-gestures.log" stringByExpandingTildeInPath] fileSystemRepresentation];
+    struct stat st;
+    FILE *f = fopen(path, (stat(path, &st) == 0 && st.st_size > 1024 * 1024) ? "w" : "a"); // ponytail: 1 MB cap, starts over
+    if (!f) return;
+    time_t now = time(NULL);
+    char ts[32];
+    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", localtime(&now));
+    fprintf(f, "%s %s\n", ts, line);
+    fclose(f);
+#endif
+}
+
+static void mmLog(const char *what, const char *letter, float score) {
+#ifdef JITOUCH_TRACE
+    printf("   %s %s (strokes %d, score %.2f)\n", what, letter ? letter : "-", mmStrokes, score);
+#endif
+    char line[160];
+    snprintf(line, sizeof line, "%s %s strokes=%d score=%.2f", what, letter ? letter : "-", mmStrokes, score);
+    mmLogLine(line);
+}
+// The sensor is 10 columns x 15 rows (MultitouchSupport reports it), so one normalized unit across the mouse is
+// physically shorter than one along it. $P compares shapes, so x is scaled to make strokes physically proportioned.
+static const float pdollarAspectX = 10.0f / 15.0f;
+static pthread_mutex_t mmLock = PTHREAD_MUTEX_INITIALIZER;
+
+static void mmEnd(int recognize) { // call with mmLock held
+    if (recognize && mmShown) {
+        const char *letter = NULL, *why = NULL;
+        float score = 0;
+        if (mmStrokes == 1 && (letter = pdollarRecognize(mmPts, mmNPts, personalMaxScore, &score, 1))) {
+            // matched your own trained handwriting closely: that wins over the built-in direction templates
+        } else if (mmStrokes == 1) {
+            letter = finalizeStep(mmFirst[0], mmFirst[1], mmLast[0], mmLast[1], mmTop, mmBottom, mmLeft, mmRight);
+            for (int i = 0; mmScrollLike[i]; i++)
+                if (strcmp(letter, mmScrollLike[i]) == 0) why = "rejected-scroll-like";
+        } else if (mmParallelFlicks()) {
+            why = "rejected-parallel-flicks";
+        } else {
+            letter = pdollarRecognize(mmPts, mmNPts, pdollarMaxScore, &score, 0);
+            if (!letter) why = "rejected-no-match";
+        }
+        if (!why && (!letter || strcmp(letter, "?") == 0)) why = "rejected-no-match";
+        mmLog(why ? why : "fired", letter, score);
+        if (!why) {
+            NSString *commandString = [[NSString alloc] initWithUTF8String:letter];
+            dispatchCommand(commandString, CHARRECOGNITION);
+            [commandString release];
+        }
+    }
+    if (mmShown) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [gestureWindow clear];
+            [gestureWindow orderOut:nil];
+        });
+    }
+    cancelRecognition = 0;
+    isMMFingerRecognizing = 0;
+    mmStep = 0;
+    mmGen++;
+}
+
+static void magicMouseFingerRecognizer(const Finger *data, int nFingers, double timestamp) {
+    // ponytail: calibration knobs. The mouse surface is narrower than it is long, so letters can read squished;
+    // raise mmAspect above 1 if wide letters (M, W) misrecognize. tapMoveMax = how far a "tap" may wander.
+    static const float mmAspect = 1.0f;
+    static const float tapMoveMax = 0.0008f; // measured deliberate taps moved at most 0.0003
+    // Timing measured from real use (2026-11-10 recordings): taps last 0.09-0.26 s and people put the finger
+    // back down 0.75-0.9 s after the tap, far slower than Jitouch's double-click speed (0.25 s).
+    static const double tapMaxHold = 0.35, drawGapMax = 1.2;
+    static const float dst = 0.0002f;
+
+    static int lastN = 0, drawId = -1, tapClicked = 0;
+    static double tapStartWall, tapEndWall;
+    static double t0, hintTime = -1;
+    static float tapPos[2], lpos[2];
+
+    pthread_mutex_lock(&mmLock);
+
+    // A thumb or ring finger resting on the lower side edges (Jitouch's thumb zone, both sides) is part of
+    // a normal grip, not a gesture, so it doesn't count. The drawing finger always counts, tracked by id.
+    const Finger *f = NULL;
+    int nActive = 0;
+    for (int i = 0; i < nFingers; i++) {
+        int resting = (data[i].px <= 0.15 || data[i].px >= 0.85) && data[i].py <= 0.6;
+        if (data[i].identifier == drawId || !resting) {
+            nActive++;
+            if (f == NULL || data[i].identifier == drawId)
+                f = &data[i];
+        }
+    }
+    nFingers = nActive;
+    float x = f ? f->px * mmAspect : 0;
+    float y = f ? f->py : 0;
+
+    if (mmStep == 4 && timestamp - t0 > strokeGap) // waited long enough after the last stroke: read the letter
+        mmEnd(1);
+
+    double wall = CFAbsoluteTimeGetCurrent();
+    if (mmStep == 1 && mmButtonDown())
+        tapClicked = 1;
+
+    if (mmStep == 1) { // first touch: must be a short tap that barely moves, with no click and no scrolling
+        if (nFingers == 0 && timestamp - t0 <= tapMaxHold) {
+            int clicked = tapClicked || mmLastClickWall >= tapStartWall - 0.05;
+            int scrolling = mmLastScrollWall >= tapStartWall - scrollQuiet;
+#ifdef JITOUCH_TRACE
+            if (clicked || scrolling) printf("%.3f   not a tap: %s\n", timestamp, clicked ? "mouse click" : "scrolling");
+#endif
+            if (clicked || scrolling) // a still, short touch that would have been a tap: say why it wasn't
+                mmLogLine(clicked ? "tap-refused: the mouse button clicked" : "tap-refused: scrolling just before");
+            mmStep = (clicked || scrolling) ? 0 : 2;
+            t0 = timestamp;
+            tapEndWall = wall;
+        } else if (nFingers != 1 || timestamp - t0 > tapMaxHold || lenSqr(tapPos[0], tapPos[1], x, y) > tapMoveMax) {
+#ifdef JITOUCH_TRACE
+            printf("%.3f   not a tap: touches=%d held=%.3fs (max %.2f) moved2=%.4f (max %.4f)\n", timestamp, nFingers, timestamp - t0, tapMaxHold, lenSqr(tapPos[0], tapPos[1], x, y), tapMoveMax);
+#endif
+            mmStep = 0;
+        }
+    } else if (mmStep == 2 || mmStep == 4) { // waiting for the first stroke (after the tap) or the next stroke
+        double wait = mmStep == 2 ? drawGapMax : strokeGap;
+        if (mmStep == 2 && (mmLastScrollWall > tapEndWall || mmLastClickWall > tapEndWall)) {
+            mmStep = 0; // scrolled (e.g. momentum) or clicked after the tap: not a gesture
+        } else if (mmStep == 4 && nFingers == 1 && timestamp - t0 <= mergeGap &&
+                   lenSqr(lpos[0], lpos[1], x, y) <= mergeDist * mergeDist) {
+            // The finger slipped off for an instant and came back where it left: same stroke, carry on.
+            mmStep = 3;
+            mmGen++; // cancels the pending end-of-letter timer
+            drawId = f->identifier;
+        } else if (nFingers == 1 && timestamp - t0 <= wait) {
+            if (mmStep == 2) {
+                mmShown = 0;
+                mmStrokes = 0;
+                mmNPts = 0;
+                isMMFingerRecognizing = 1; // blocks scroll and other mouse gestures while drawing
+                clearStep();
+                mmFirst[0] = mmLast[0] = x;
+                mmFirst[1] = mmLast[1] = y;
+                mmTop = 0; mmBottom = 1; mmLeft = 1; mmRight = 0;
+            } else {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [gestureWindow breakStroke];
+                    [gestureWindow setHintText: emptyString];
+                });
+            }
+            mmStep = 3;
+            mmGen++; // cancels a pending end-of-letter timer
+            mmStrokes++;
+            hintTime = -1;
+            drawId = f->identifier;
+            lpos[0] = x;
+            lpos[1] = y;
+            if (mmNPts < MM_MAX_POINTS) mmPts[mmNPts++] = (PDPoint){x * pdollarAspectX, y, mmStrokes};
+            if (mmShown)
+                dispatch_async(dispatch_get_main_queue(), ^{ [gestureWindow addPointX:x Y:y]; });
+        } else if (nFingers > 1) {
+            mmEnd(0);
+        } else if (mmStep == 2 && (nFingers != 0 || timestamp - t0 > drawGapMax)) {
+            mmStep = 0;
+        }
+    } else if (mmStep == 3) { // drawing a stroke
+        if (nFingers == 0 && !cancelRecognition) { // finger lifted: wait for another stroke
+            if (!mmShown) {
+                mmStep = 0; // the finger never moved: a plain double tap, not a letter
+                isMMFingerRecognizing = 0;
+            } else {
+                mmStep = 4;
+                t0 = timestamp;
+                int gen = ++mmGen;
+#ifndef JITOUCH_TEST
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(strokeGap * NSEC_PER_SEC)),
+                               dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+                    pthread_mutex_lock(&mmLock);
+                    if (mmStep == 4 && mmGen == gen) mmEnd(1);
+                    pthread_mutex_unlock(&mmLock);
+                });
+#endif
+            }
+            drawId = -1;
+        } else if (nFingers != 1 || f->identifier != drawId || cancelRecognition) {
+            mmEnd(0); // second finger, or Jitouch gave up on the shape
+            drawId = -1;
+        } else {
+            if (mmStrokes == 1) {
+                if (y > mmTop) mmTop = y;
+                if (y < mmBottom) mmBottom = y;
+                if (x > mmRight) mmRight = x;
+                if (x < mmLeft) mmLeft = x;
+            }
+            if (lenSqr(lpos[0], lpos[1], x, y) > dst) {
+                if (mmStrokes == 1) {
+                    advanceStep(atan2(y - lpos[1], x - lpos[0]));
+                    mmLast[0] = x;
+                    mmLast[1] = y;
+                }
+                if (mmNPts < MM_MAX_POINTS) mmPts[mmNPts++] = (PDPoint){x * pdollarAspectX, y, mmStrokes};
+                if (!mmShown) { // show the ink only once the finger moves, so a plain double tap stays invisible
+                    mmShown = 1;
+                    float fx = mmPts[0].x / pdollarAspectX, fy = mmPts[0].y;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [gestureWindow setHintText: emptyString];
+                        [gestureWindow setUpWindowForMouseSurface];
+                        [gestureWindow addPointX:fx Y:fy];
+                        [gestureWindow display];
+                        [gestureWindow setLevel:NSScreenSaverWindowLevel];
+                        [gestureWindow makeKeyAndOrderFront:nil];
+                    });
+                }
+                lpos[0] = x;
+                lpos[1] = y;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [gestureWindow setHintText: emptyString];
+                    [gestureWindow addPointX:x Y:y];
+                });
+                hintTime = mmStrokes == 1 ? timestamp : -1; // hint only for one-stroke letters
+            } else if (hintTime > 0 && timestamp - hintTime >= hintWaitTime) {
+                const char *hint = finalizeStep(mmFirst[0], mmFirst[1], mmLast[0], mmLast[1], mmTop, mmBottom, mmLeft, mmRight);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [gestureWindow setHintText: hint];
+                });
+                hintTime = -1;
+            }
+        }
+    }
+
+#ifdef JITOUCH_TRACE
+    { static int ps = 0; if (mmStep != ps) printf("%.3f step %d -> %d  touches=%d at (%.2f,%.2f) strokes=%d\n", timestamp, ps, mmStep, nFingers, x, y, mmStrokes); ps = mmStep; }
+#endif
+    if (mmStep == 0 && lastN == 0 && nFingers == 1) { // a fresh touch starts a possible tap
+        mmStep = 1;
+        t0 = timestamp;
+        tapStartWall = wall;
+        tapClicked = mmButtonDown();
+        tapPos[0] = x;
+        tapPos[1] = y;
+    }
+    lastN = nFingers;
+    pthread_mutex_unlock(&mmLock);
 }
 
 static void trackpadRecognizerTwo(const Finger *data, int nFingers, double timestamp) {

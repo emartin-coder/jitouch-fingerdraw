@@ -38,9 +38,13 @@
         NSPoint startPoint = [[points objectAtIndex:0] pointValue];
         CGContextMoveToPoint(context, startPoint.x, startPoint.y);
         float minX = 10000, minY = 10000;
+        BOOL penUp = NO;
         for (NSUInteger i = 1; i < [points count]; i++) {
             currentPoint = [[points objectAtIndex:i] pointValue];
-            CGContextAddLineToPoint(context, currentPoint.x, currentPoint.y);
+            if (isnan(currentPoint.x)) { penUp = YES; continue; }
+            if (penUp) CGContextMoveToPoint(context, currentPoint.x, currentPoint.y);
+            else CGContextAddLineToPoint(context, currentPoint.x, currentPoint.y);
+            penUp = NO;
             if (currentPoint.x < minX)
                 minX = currentPoint.x;
             if (currentPoint.y < minY)
@@ -51,11 +55,27 @@
         CGContextSetLineWidth(context, 10.0);
         CGContextSetRGBStrokeColor(context, 0, 0, 0, 0.6);
         CGContextMoveToPoint(context, startPoint.x, startPoint.y);
+        penUp = NO;
         for (NSUInteger i = 1; i < [points count]; i++) {
             currentPoint = [[points objectAtIndex:i] pointValue];
-            CGContextAddLineToPoint(context, currentPoint.x, currentPoint.y);
+            if (isnan(currentPoint.x)) { penUp = YES; continue; }
+            if (penUp) CGContextMoveToPoint(context, currentPoint.x, currentPoint.y);
+            else CGContextAddLineToPoint(context, currentPoint.x, currentPoint.y);
+            penUp = NO;
         }
         CGContextStrokePath(context);
+
+        // Where your finger is now (or just landed for the next stroke), so you can aim the next stroke.
+        for (NSInteger i = (NSInteger)[points count] - 1; i >= 0; i--) {
+            NSPoint p = [[points objectAtIndex:i] pointValue];
+            if (isnan(p.x)) continue;
+            CGContextSetRGBFillColor(context, 1, 0.55, 0.2, 0.85);
+            CGContextFillEllipseInRect(context, CGRectMake(p.x - 9, p.y - 9, 18, 18));
+            CGContextSetLineWidth(context, 3.0);
+            CGContextSetRGBStrokeColor(context, 1, 1, 1, 0.9);
+            CGContextStrokeEllipseInRect(context, CGRectMake(p.x - 9, p.y - 9, 18, 18));
+            break;
+        }
 
         [[NSString stringWithUTF8String:hintText]
          drawAtPoint:CGPointMake(minX, minY - 70.0)
@@ -88,6 +108,9 @@
     [self setNeedsDisplay:YES];
 }
 
+- (void)breakStroke { // pen lift between strokes of a multi-stroke letter
+    [points addObject:[NSValue valueWithPoint:NSMakePoint(NAN, NAN)]];
+}
 - (void)clear {
     [points removeAllObjects];
     [self setNeedsDisplay:YES];

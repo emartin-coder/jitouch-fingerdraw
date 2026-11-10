@@ -3,3 +3,8 @@ xcuserdata
 /prefpane/Jitouch.app
 /build
 .DS_Store
+
+# Personal: your handwriting recordings and touch traces never get published
+/training
+/tests/fixtures
+__pycache__/

@@ -1,0 +1,10 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-macos, x86_64-macos ]
+install-name:    '/System/Library/PrivateFrameworks/MultitouchSupport.framework/Versions/A/MultitouchSupport'
+exports:
+  - targets:     [ arm64-macos, x86_64-macos ]
+    symbols:     [ _MTDeviceCreateList, _MTDeviceGetDeviceID, _MTDeviceGetFamilyID, _MTDeviceIsRunning,
+                   _MTDeviceStart, _MTDeviceStop, _MTRegisterContactFrameCallback,
+                   _MTUnregisterContactFrameCallback, _MTDeviceRelease ]
+...

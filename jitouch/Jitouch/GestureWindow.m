@@ -55,6 +55,15 @@ static float magicMouseHeight = 800;
     size = scr.size;
     [self setFrame:NSMakeRect(orig.x+size.width/2 - trackpadWidth/2, orig.y+size.height/2 - trackpadHeight/2, trackpadWidth, trackpadHeight) display:YES];
 }
+// Fingertip drawing on the Magic Mouse: same height as the trackpad box, but as narrow as the mouse surface
+// (sensor is 10 x 15), so a letter on screen has the proportions your finger drew. GestureView keeps a
+// 180 x 130 margin for the start ring and hint text, so only the drawing area gets the mouse's shape.
+- (void)setUpWindowForMouseSurface {
+    [self setUpWindowForTrackpad]; // picks the screen under the pointer and centers on it
+    NSRect f = [self frame];
+    float width = (trackpadHeight - 130) * (10.0f / 15.0f) + 180;
+    [self setFrame:NSMakeRect(f.origin.x + (f.size.width - width) / 2, f.origin.y, width, f.size.height) display:YES];
+}
 - (void)setUpWindowForMagicMouse {
     CGEventRef ourEvent = CGEventCreate(NULL);
     CGPoint ourLoc = CGEventGetUnflippedLocation(ourEvent);
@@ -75,6 +84,10 @@ static float magicMouseHeight = 800;
 - (void)addRelativePointX:(float)x Y:(float)y {
     [gestureView addRelativePointX:x Y:y];
 }
+- (void)breakStroke {
+    [gestureView breakStroke];
+}
+
 - (void)clear {
     [gestureView clear];
 }

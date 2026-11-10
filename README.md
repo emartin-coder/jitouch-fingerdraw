@@ -1,35 +1,74 @@
-# Jitouch
+# Jitouch FingerDraw
 
-**Jitouch** is a Mac application that expands the set of multi-touch gestures for MacBook, Magic Mouse, and Magic Trackpad. These thoughtfully designed gestures enable users to perform frequent tasks more easily such as changing tabs in web browsers, closing windows, minimizing windows, changing spaces, and a lot more.
+Draw letters with your fingertip on the top of an Apple Magic Mouse, and each letter runs an action: open an app, open a link or file, press a keyboard shortcut. Out of the box, **F** opens Finder and **B** opens your browser. You can map any letter.
 
-For more details, see https://www.jitouch.com/.
+It's a fork of [Jitouch](https://github.com/JitouchApp/Jitouch). Jitouch already recognizes letters on the Magic Mouse, but you draw them by moving the whole mouse. FingerDraw reads your fingertip on the mouse's touch surface instead.
 
-## Installation
+## What it adds to Jitouch
 
-Download `Install-Jitouch.pkg` from the [releases](https://github.com/aaronkollasch/jitouch/releases/latest) page.
-Double-click and follow the instructions to install.
+- **Fingertip drawing on the Magic Mouse surface.** Tap once, put your finger back down, draw, lift.
+- **Letters with several strokes,** written the normal way, such as F as a stem plus two bars. Built in: A B D E F H K P R T X. Any other multi-stroke letter works once you train it.
+- **Learns your handwriting** (optional). Record each letter a few times, and recognition is matched to how you write.
+- **Doesn't fire while you scroll or click.** A click and a scroll flick both start with a touch, so these are ignored: taps that click the button, touches during scrolling, single straight or back-and-forth strokes, and runs of parallel flicks.
+- **On-screen ink** in the mouse's real proportions, with a ring showing where your finger is.
+- **A log** of every gesture, fired or ignored, with the reason: `~/Library/Logs/Jitouch-gestures.log`.
 
-## Troubleshooting
+## How to draw
 
-When opening the Jitouch preference pane for the first time, you may see an error message such as "Could not load Jitouch preference pane". If so, restarting your computer should fix this.
+1. **Tap** the top of the mouse once, lightly. A tap that clicks the button doesn't count.
+2. Within about a second, **put your finger back down and draw** the letter.
+3. For letters with more than one stroke, **lift and keep going**. The letter is read half a second after your last stroke.
 
-After opening the Jitouch preference pane in System Preferences, a prompt should appear to give Jitouch accessibility permissions. If the prompt doesn't appear, try switching Jitouch off and on in the Jitouch preference pane. Otherwise, you will need to manually give Jitouch permissions.
+Single straight or back-and-forth strokes (up, down, left, right, diagonal) are ignored on the mouse, because they look exactly like scrolling.
 
-#### To manually give Jitouch permissions:
-- Go to the folder `/Library/PreferencePanes/Jitouch.prefPane/Contents/Resources/` in Finder. If you installed Jitouch for your user only, replace `/Library` with `~/Library`. This folder should contain an application named Jitouch.app.
-- Open System Preferences and go to "Security & Privacy -> Privacy -> Accessibility", which is a list labeled "Allow these apps to control your computer".
-- Click the lock to make changes, then drag Jitouch.app from Finder into that list.
-- Force restart Jitouch with `killall Jitouch` in the Terminal.
+## Install
 
-## How to build from source
+Requirements: a Mac with Apple silicon, a Magic Mouse, and the Xcode Command Line Tools (`xcode-select --install`). Full Xcode isn't needed. Tested only on macOS 26.5.
 
-1. Open jitouch/Jitouch/Jitouch.xcodeproj in Xcode and build the project. This will create Jitouch.app in the prefpane folder. For the highest performance, set the Build Configuration to Release.
-2. Open prefpane/Jitouch.xcodeproj in Xcode and build the project. This will create Jitouch.prefPane.
-3. Double-click Jitouch.prefPane to install Jitouch.
+```sh
+git clone <this repo> && cd <repo>
+./build.sh            # downloads the official Jitouch 2.82.1 bundle, runs the tests, builds, installs
+```
 
-## License
+This installs `/Applications/Jitouch.app` and, if you don't already have it, the Jitouch settings panel in `~/Library/PreferencePanes`. Then:
 
-Copyright (c) Supasorn Suwajanakorn and Sukolsak Sakshuwong. All rights reserved.  
-Modified work copyright (c) Aaron Kollasch. All rights reserved.
+1. Allow Jitouch under System Settings > Privacy & Security > Accessibility.
+2. Open the settings (menu bar icon > Open Preferences...). On the **Characters** tab, under "Enable Character Recognition for", tick **Mouse** (it's off by default), then map letters to actions. Opening the settings also sets Jitouch to start at login.
 
-Licensed under the [GNU General Public License v3.0](LICENSE).
+**Each rebuild resets the Accessibility permission,** because the app is signed only for your Mac. To avoid that, run `./make-signing-identity.sh` once. It creates a local code-signing certificate that `build.sh` uses automatically. Allow Accessibility once more after the first build that uses it.
+
+## Teach it your handwriting (optional)
+
+```sh
+tools/train.sh G M Y      # spoken cues: draw each letter 8 times, pause about 2 s between letters, don't tap
+```
+
+Your examples are saved to `~/Library/Application Support/Jitouch/letters.txt`, and restarting Jitouch loads them. On your next build, `tests/run.sh` checks that each example is recognized using your other examples.
+
+## Limitations
+
+- **Private Apple framework.** Touch data comes from Apple's private MultitouchSupport framework, so a macOS update can break it, and it can't be distributed through the Mac App Store.
+- **Apple silicon only, and not notarized.** You build it yourself.
+- **Tuned on one person.** The timing and matching cutoffs come from one person's hand and one mouse. The scroll check in `tests/run.sh` only has data if you record your own scrolling into `tests/fixtures/negatives/` (`mkdir -p tests/fixtures/negatives && build/touch_probe 120 > tests/fixtures/negatives/my-scrolling.log`). If something misfires, the gesture log says why.
+- **Old settings panel.** It's the original Jitouch one. The fingertip mode has no settings of its own; its tuning values are constants in `jitouch/Jitouch/Gesture.m`.
+
+## Privacy
+
+Recognition, training and logs stay on your Mac. The app's source makes no network requests of its own. Only actions you configure, such as opening a website, use the network. `build.sh` downloads the official Jitouch release once, from GitHub.
+
+## Development
+
+| Command | What it does |
+|---|---|
+| `tests/run.sh` | Recognizer tests (synthetic touch input), plus checks on your trained letters |
+| `build/touch_probe 30 > rec.log` | Records raw Magic Mouse touches for 30 s |
+| `tests/replay.sh rec.log` | Replays a recording through the recognizer, with a step-by-step trace |
+| `./build.sh --no-install` | Tests and builds into `build/` without installing |
+
+## Credits and license
+
+GPL-3.0, like Jitouch. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+- Jitouch: copyright Supasorn Suwajanakorn and Sukolsak Sakshuwong. Modified work copyright Aaron Kollasch.
+- Multi-stroke recognition implements the $P point-cloud recognizer described by Vatavu, Anthony and Wobbrock (ICMI 2012).
+- FingerDraw changes: copyright 2026 emartin-coder.

@@ -25,4 +25,4 @@ plutil -replace 0.BundleIsVersionChecked -bool NO $R/components.plist
 PKG=$R/Jitouch-FingerDraw-$VERSION.pkg
 pkgbuild --root $R/root --component-plist $R/components.plist --install-location /Library/PreferencePanes \
   --identifier io.github.emartin-coder.jitouch-fingerdraw --version $VERSION $PKG
-shasum -a 256 $PKG | tee $PKG.sha256
+(cd $R && shasum -a 256 ${PKG:t} | tee ${PKG:t}.sha256)   # bare filename, so `shasum -c` works after download

@@ -2,15 +2,17 @@
 
 Draw letters with your fingertip on the top of an Apple Magic Mouse, and each letter runs an action: open an app, open a link or file, press a keyboard shortcut. Out of the box, **F** opens Finder and **B** opens your browser. You can map any letter.
 
-![Tap the mouse, draw F with your fingertip, and Finder opens](docs/demo.gif)
+![Draw F with your fingertip on the mouse, and Finder opens](docs/demo.gif)
 
-*A real fingertip F recorded from the Magic Mouse's touch sensor and replayed. The right panel is zoomed.*
+*A real fingertip F recorded from the Magic Mouse's touch sensor and replayed. The right panel is zoomed. Recorded with the earlier tap-to-start version: letters now start with a short still hold.*
 
 It's a fork of [Jitouch](https://github.com/JitouchApp/Jitouch). Jitouch already recognizes letters on the Magic Mouse, but you draw them by moving the whole mouse. FingerDraw reads your fingertip on the mouse's touch surface instead.
 
 ## What it adds to Jitouch
 
-- **Fingertip drawing on the Magic Mouse surface.** Tap once, put your finger back down, draw, lift.
+- **Fingertip drawing on the Magic Mouse surface.** Hold a finger still for half a second, then draw and lift.
+- **Tap to click.** A light one-finger tap is a left click; two quick taps double-click (at your system's double-click speed). A two-finger tap is a right click.
+- **Drag with a fingertip.** Touch the top of the mouse and move the mouse right away, and whatever is under the pointer gets dragged until you lift. Or tap, touch again, and move.
 - **Letters with several strokes,** written the normal way, such as F as a stem plus two bars. Built in: A B D E F H K P R T X. Any other multi-stroke letter works once you train it.
 - **Learns your handwriting** (optional). Record each letter a few times, and recognition is matched to how you write.
 - **Doesn't fire while you scroll or click.** A click and a scroll flick both start with a touch, so these are ignored: taps that click the button, touches during scrolling, single straight or back-and-forth strokes, and runs of parallel flicks.
@@ -19,8 +21,8 @@ It's a fork of [Jitouch](https://github.com/JitouchApp/Jitouch). Jitouch already
 
 ## How to draw
 
-1. **Tap** the top of the mouse once, lightly. A tap that clicks the button doesn't count.
-2. Within about a second, **put your finger back down and draw** the letter.
+1. **Rest one finger** on the top of the mouse and keep it, and the mouse, still for about half a second. A dot appears.
+2. **Draw** the letter without lifting. A finger left still for more than 1.5 s counts as resting, not drawing.
 3. For letters with more than one stroke, **lift and keep going**. The letter is read half a second after your last stroke.
 
 Single straight or back-and-forth strokes (up, down, left, right, diagonal) are ignored on the mouse, because they look exactly like scrolling.

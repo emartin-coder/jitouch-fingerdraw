@@ -27,7 +27,14 @@ T=$(mktemp -d)
 fail=0
 for k in tests/fixtures/real-F-*.log(N); do  # recordings are personal and not published; skipped when absent
   for j in tests/fixtures/real-F-*.log; do [[ $j == $k ]] || python3 tools/learn.py F $j --out $T/letters.txt >/dev/null; done
-  got=$(JITOUCH_LETTERS=$T/letters.txt build/replay $k | sed -n 's/.*RECOGNIZED "\(.*\)"/\1/p' | tail -1)
+  # Recorded with the old tap start: drop the tap, and hold the finger still 0.6 s where the first stroke begins.
+  python3 -c '
+import sys; L=open(sys.argv[1]).read().splitlines(); up=lambda l: " n=0" in l; i=0
+while not up(L[i]): i+=1  # the tap
+while up(L[i]): i+=1      # the gap after it
+t=float(L[i].split()[0]); rest=L[i].split(None,1)[1]
+print("\n".join("%.3f %s" % (t-0.6+j*0.01, rest) for j in range(60))); print("\n".join(L[i:]))' $k > $T/held.log
+  got=$(JITOUCH_LETTERS=$T/letters.txt build/replay $T/held.log | sed -n 's/.*RECOGNIZED "\(.*\)"/\1/p' | tail -1)
   rm -f $T/letters.txt
   if [[ $got == F ]]; then echo "PASS  real F, leave-one-out: ${k:t}"; else echo "FAIL  real F, leave-one-out: ${k:t} got '${got:-nothing}'"; fail=1; fi
 done

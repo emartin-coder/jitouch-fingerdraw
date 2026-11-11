@@ -10,6 +10,9 @@
 #import "PDollar.h"
 #include <pthread.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <mach/mach_time.h>
+#include <libproc.h>
 #import <math.h>
 #import <unistd.h>
 #import <CoreFoundation/CoreFoundation.h>
@@ -184,6 +187,16 @@ static int isTrackpadRecognizing, isMouseRecognizing, isMMFingerRecognizing;
 // Set by the event tap: when the system last scrolled (including momentum) and when a mouse button went down.
 // A Magic Mouse click and a scroll flick both start with a touch, so these tell a deliberate tap apart from them.
 static volatile double mmLastScrollWall, mmLastClickWall;
+static const int64_t mmSynthMark = 0x4A54464E; // tags clicks we post, so they don't count as you clicking
+static volatile int mmDragging; // 1: dragging, pointer moves become drags. 2: finger just lifted, item held still
+static volatile double mmLastMoveWall; // last time the pointer moved on its own (not while we drag)
+static volatile double mmLastFrameWall, mmLastReleaseWall; // last touch frame; last drag release
+static volatile int mmHwPress; // a real button press during our drag: it owns the button now
+static CGPoint mmLiftPtr; // where the pointer was on the frame the finger lifted
+void mmForceRelease(void);
+static void mmLogLine(const char *line);
+// Drag smoothness probe: how long each pointer move waited before the event tap (on the main thread) saw it.
+static volatile uint64_t mmLatN, mmLatSumUp, mmLatMaxUp; static volatile int64_t mmLatMach0;
 #ifdef JITOUCH_TEST
 static int jtTestButtonDown; // tests stand in for the physical button
 #endif
@@ -237,20 +250,22 @@ static void turnOffMagicMouse() {
     simulating = 0;
     disableHorizontalScroll = 0;
     quickTabSwitching = 0;
-    [cursorWindow orderOut:nil];
+    // The touch thread calls this too, and AppKit crashes on window changes off the main thread (crash 2026-11-10).
+    dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow orderOut:nil]; });
 }
 
 static void turnOffCharacters() {
-    NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-    [gestureWindow clear];
-    [gestureWindow orderOut:nil];
-    [pool release];
+    dispatch_async(dispatch_get_main_queue(), ^{ // may be called off the main thread, like turnOffMagicMouse
+        [gestureWindow clear];
+        [gestureWindow orderOut:nil];
+    });
     isTrackpadRecognizing = 0;
     isMouseRecognizing = 0;
     isMMFingerRecognizing = 0;
 }
 
 void turnOffGestures() {
+    mmForceRelease();
     turnOffTrackpad();
     turnOffMagicMouse();
     turnOffCharacters();
@@ -552,7 +567,7 @@ static void findTabGroup2(CFTypeRef windowRef, float cx, float cy) {
         CFRelease(tmp);
     }
     NSRect scr = [[NSScreen mainScreen] frame];
-    [cursorWindow setFrameOrigin:NSMakePoint(cx - 31, scr.size.height - tabY - 20)];
+    dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow setFrameOrigin:NSMakePoint(cx - 31, scr.size.height - tabY - 20)]; }); // AppKit only on the main thread
 }
 
 static int selectSafariTab() {
@@ -643,12 +658,26 @@ static NSString* commandForGesture(NSString *gesture, int device) {
 }
 
 
+// The screenshot crosshair is up exactly while /usr/sbin/screencapture runs (screencaptureui lingers after, so not that).
+static int screenshotCrosshairUp(void) {
+    pid_t pids[4096];
+    int n = proc_listallpids(pids, sizeof pids);
+    char name[64];
+    for (int i = 0; i < n; i++)
+        if (proc_name(pids[i], name, sizeof name) > 0 && strcmp(name, "screencapture") == 0) return 1;
+    return 0;
+}
+
 static void dispatchCommand(NSString *gesture, int device) {
 #ifdef JITOUCH_TEST
     jtTestRecognized = [gesture copy]; // tests/test_fingerdraw.m records the result instead of running the action
     return;
 #endif
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+        if (device == CHARRECOGNITION && [gesture isEqualToString:@"S"] && screenshotCrosshairUp()) {
+            [keyUtil simulateKeyCode:53 ShftDown:NO CtrlDown:NO AltDown:NO CmdDown:NO]; // S again = Escape: cancel the crosshair
+            return;
+        }
         NSDate *start = [NSDate date];
         doCommand(gesture, device);
         NSTimeInterval timeInterval = -[start timeIntervalSinceNow];
@@ -993,7 +1022,9 @@ static void setCursorWindowAtMouse() {
     CGEventRef ourEvent = CGEventCreate(NULL);
     CGPoint location = CGEventGetUnflippedLocation(ourEvent);
     CFRelease(ourEvent);
-    [cursorWindow setFrameOrigin:NSMakePoint(location.x - 31, location.y - 29)];
+    dispatch_async(dispatch_get_main_queue(), ^{ // called from touch threads; AppKit only on the main thread
+        [cursorWindow setFrameOrigin:NSMakePoint(location.x - 31, location.y - 29)];
+    });
 }
 
 
@@ -1222,7 +1253,7 @@ static int gestureTrackpadMoveResize(const Finger *data, int nFingers, double ti
                 getMousePosition(&baseX, &baseY);
                 dispatch_async(dispatch_get_main_queue(), ^{
                     @autoreleasepool {
-                        [cursorWindow orderOut:nil];
+                        dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow orderOut:nil]; }); // AppKit only on the main thread
                     }
                 });
                 if (cWindow == nil)
@@ -1236,11 +1267,11 @@ static int gestureTrackpadMoveResize(const Finger *data, int nFingers, double ti
                     cursorImageType = type - 1;
                     dispatch_async(dispatch_get_main_queue(), ^{
                         @autoreleasepool {
-                            [cursorWindow display];
-                            [[cursorWindow contentView] setNeedsDisplay:YES];
+                            dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow display]; }); // AppKit only on the main thread
+                            dispatch_async(dispatch_get_main_queue(), ^{ [[cursorWindow contentView] setNeedsDisplay:YES]; }); // AppKit only on the main thread
                             setCursorWindowAtMouse();
-                            [cursorWindow setLevel:NSScreenSaverWindowLevel];
-                            [cursorWindow makeKeyAndOrderFront:nil];
+                            dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow setLevel:NSScreenSaverWindowLevel]; }); // AppKit only on the main thread
+                            dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow makeKeyAndOrderFront:nil]; }); // AppKit only on the main thread
                         }
                     });
 
@@ -1268,7 +1299,7 @@ static int gestureTrackpadMoveResize(const Finger *data, int nFingers, double ti
                         type = 0;
                         dispatch_async(dispatch_get_main_queue(), ^{
                             @autoreleasepool {
-                                [cursorWindow orderOut:nil];
+                                dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow orderOut:nil]; }); // AppKit only on the main thread
                             }
                         });
                         CFSafeRelease(cWindow);
@@ -1313,7 +1344,7 @@ static int gestureTrackpadMoveResize(const Finger *data, int nFingers, double ti
                 cWindow = nil;
                 dispatch_async(dispatch_get_main_queue(), ^{
                     @autoreleasepool {
-                        [cursorWindow orderOut:nil];
+                        dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow orderOut:nil]; }); // AppKit only on the main thread
                     }
                 });
 
@@ -1399,7 +1430,7 @@ static int gestureTrackpadMoveResize(const Finger *data, int nFingers, double ti
                         cWindow = nil;
                         dispatch_async(dispatch_get_main_queue(), ^{
                             @autoreleasepool {
-                                [cursorWindow orderOut:nil];
+                                dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow orderOut:nil]; }); // AppKit only on the main thread
                             }
                         });
 
@@ -2412,7 +2443,7 @@ static int gestureMagicMouseV(const Finger *data, int nFingers) {
             cWindow = nil;
             dispatch_async(dispatch_get_main_queue(), ^{
                 @autoreleasepool {
-                    [cursorWindow orderOut:nil];
+                    dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow orderOut:nil]; }); // AppKit only on the main thread
                 }
             });
             type = 0;
@@ -2431,7 +2462,7 @@ static int gestureMagicMouseV(const Finger *data, int nFingers) {
         getMousePosition(&baseX, &baseY);
         dispatch_async(dispatch_get_main_queue(), ^{
             @autoreleasepool {
-                [cursorWindow orderOut:nil];
+                dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow orderOut:nil]; }); // AppKit only on the main thread
             }
         });
         if (cWindow == nil)
@@ -2445,11 +2476,11 @@ static int gestureMagicMouseV(const Finger *data, int nFingers) {
             cursorImageType = type - 1;
             dispatch_async(dispatch_get_main_queue(), ^{
                 @autoreleasepool {
-                    [cursorWindow display];
-                    [[cursorWindow contentView] setNeedsDisplay:YES];
+                    dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow display]; }); // AppKit only on the main thread
+                    dispatch_async(dispatch_get_main_queue(), ^{ [[cursorWindow contentView] setNeedsDisplay:YES]; }); // AppKit only on the main thread
                     setCursorWindowAtMouse();
-                    [cursorWindow setLevel:NSScreenSaverWindowLevel];
-                    [cursorWindow makeKeyAndOrderFront:nil];
+                    dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow setLevel:NSScreenSaverWindowLevel]; }); // AppKit only on the main thread
+                    dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow makeKeyAndOrderFront:nil]; }); // AppKit only on the main thread
                 }
             });
         }
@@ -2467,7 +2498,7 @@ static int gestureMagicMouseV(const Finger *data, int nFingers) {
                     cWindow = nil;
                     dispatch_async(dispatch_get_main_queue(), ^{
                         @autoreleasepool {
-                            [cursorWindow orderOut:nil];
+                            dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow orderOut:nil]; }); // AppKit only on the main thread
                         }
                     });
                     type = 0;
@@ -2601,9 +2632,9 @@ static int gestureMagicMouseThumb(const Finger *data, int nFingers) {
                     if (selectSafariTab()) { // mouse is on Safari
                         cursorImageType = 2;
                         NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-                        [cursorWindow display];
-                        [cursorWindow setLevel:NSScreenSaverWindowLevel];
-                        [cursorWindow makeKeyAndOrderFront:nil];
+                        dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow display]; }); // AppKit only on the main thread
+                        dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow setLevel:NSScreenSaverWindowLevel]; }); // AppKit only on the main thread
+                        dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow makeKeyAndOrderFront:nil]; }); // AppKit only on the main thread
                         [pool release];
                         type = 1;
                         quickTabSwitching = 1;
@@ -2628,7 +2659,7 @@ static int gestureMagicMouseThumb(const Finger *data, int nFingers) {
             ret = tb + 1;
         } else if (type == 1) {
             NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-            [cursorWindow orderOut:nil];
+            dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow orderOut:nil]; }); // AppKit only on the main thread
             [pool release];
             type = 0;
             quickTabSwitching = 0;
@@ -2646,7 +2677,7 @@ static int gestureMagicMouseThumb(const Finger *data, int nFingers) {
         }
     } else if (type == 1) {
         NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-        [cursorWindow orderOut:nil];
+        dispatch_async(dispatch_get_main_queue(), ^{ [cursorWindow orderOut:nil]; }); // AppKit only on the main thread
         [pool release];
         type = 0;
         quickTabSwitching = 0;
@@ -2774,7 +2805,7 @@ static int magicMouseCallback(MTDeviceRef device, Finger *data, int nFingers, do
             data[i].px = 1 - data[i].px;
     }
 
-    if (!ignore && !isMMFingerRecognizing) {
+    if (!ignore && !isMMFingerRecognizing && !mmDragging) { // our drag owns the touches until it ends
         int thumbPresent = gestureMagicMouseThumb(data, nFingers);
         disableHorizontalScroll = (nFingers > 1);
 
@@ -2949,6 +2980,9 @@ static void multitouchDeviceRemoved(void* refCon, io_iterator_t iterator) {
 #pragma mark - CGEventCallback
 
 static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
+    if (type >= kCGEventLeftMouseDown && type <= kCGEventRightMouseUp &&
+        CGEventGetIntegerValueField(event, kCGEventSourceUserData) == mmSynthMark)
+        return event; // a click we posted: none of Jitouch's click rules apply (they could swallow our press)
     if (type == kCGEventLeftMouseDown) {
         double timeInterval = fabs([lastTwoFingerDate timeIntervalSinceNow]);
         bool suppress = trackpadHasTwoFingers || timeInterval < 0.05;
@@ -2964,7 +2998,8 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
 
     if (type == kCGEventLeftMouseDown || type == kCGEventRightMouseDown) {
 
-        mmLastClickWall = CFAbsoluteTimeGetCurrent();
+        mmLastClickWall = CFAbsoluteTimeGetCurrent(); // our own clicks returned above
+        if (mmDragging) mmHwPress = 1;
         if (isTrackpadRecognizing) {
             cancelRecognition = 1;
             return NULL;
@@ -3056,7 +3091,7 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
     } else if (type == kCGEventScrollWheel) {
         if (!isMMFingerRecognizing)
             mmLastScrollWall = CFAbsoluteTimeGetCurrent();
-        if (magicMouseThreeFingerFlag || isTrackpadRecognizing || isMMFingerRecognizing)
+        if (magicMouseThreeFingerFlag || isTrackpadRecognizing || isMMFingerRecognizing || mmDragging)
             return NULL;
         else if (autoScrollFlag) {
             int64_t sc = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1);
@@ -3066,12 +3101,39 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
             CGEventSetIntegerValueField(event, kCGScrollWheelEventDeltaAxis2, 0);
         else if ((trackpadNFingers == 3 || trackpadNFingers == 4) && simulating == MIDDLEBUTTONDOWN)
             return NULL;
-    } else if (type == kCGEventMouseMoved) {
+    }
+    if (type == kCGEventMouseMoved || type == kCGEventLeftMouseDragged) { // after a drag, log big pointer jumps
+        static CGPoint last;
+        static int haveLast;
+        CGPoint at = CGEventGetLocation(event);
+        double since = CFAbsoluteTimeGetCurrent() - mmLastReleaseWall, jump = hypot(at.x - last.x, at.y - last.y);
+        if (haveLast && mmDragging != 1 && since < 1.0 && jump > 60) {
+            // delta = the hardware's own motion: about equal to the jump means a fast hand, not a warp
+            char line[240];
+            snprintf(line, sizeof line, "glitch? jumped %.0f px (%.0f,%.0f)->(%.0f,%.0f) delta=(%lld,%lld) pid=%lld synth=%d lift=(%.0f,%.0f), %.0f ms after a drag",
+                     jump, last.x, last.y, at.x, at.y,
+                     CGEventGetIntegerValueField(event, kCGMouseEventDeltaX), CGEventGetIntegerValueField(event, kCGMouseEventDeltaY),
+                     CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID),
+                     CGEventGetIntegerValueField(event, kCGEventSourceUserData) == mmSynthMark, mmLiftPtr.x, mmLiftPtr.y, since * 1000);
+            mmLogLine(line);
+        }
+        last = at;
+        haveLast = 1;
+    }
+    if (type == kCGEventMouseMoved) {
         if (quickTabSwitching) {
             selectSafariTab();
         } else if (simulating == MIDDLEBUTTONDOWN) {
             CGEventSetIntegerValueField(event, kCGMouseEventButtonNumber, 2);
             CGEventSetType(event, kCGEventOtherMouseDragged);
+        } else if (mmDragging == 1) {
+            CGEventSetType(event, kCGEventLeftMouseDragged);
+            uint64_t ts = CGEventGetTimestamp(event), up = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            uint64_t lat = up > ts ? up - ts : 0;
+            if (mmLatN == 0) mmLatMach0 = (int64_t)mach_absolute_time() - (int64_t)ts; // unit sanity check
+            mmLatN++; mmLatSumUp += lat; if (lat > mmLatMaxUp) mmLatMaxUp = lat;
+        } else {
+            mmLastMoveWall = CFAbsoluteTimeGetCurrent();
         }
     } else if (type == kCGEventLeftMouseDragged || type == kCGEventRightMouseDragged) {
         if (simulating == MIDDLEBUTTONDOWN) {
@@ -3081,7 +3143,9 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
     } else if (type == kCGEventTapDisabledByUserInput) {
         CGEventTapEnable(eventTap, true);
     } else if (type == kCGEventTapDisabledByTimeout) {
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+        CGEventTapEnable(eventTap, true); // CGEvent.h: a disabled tap may be re-enabled by calling this function
+        if (CGEventTapIsEnabled(eventTap)) return NULL;
+        dispatch_async(dispatch_get_main_queue(), ^{ // main: the retry NSTimer needs a running run loop
             if (recreatingEventTap) return;
             recreatingEventTap = TRUE;
             NSLog(@"Received kCGEventTapDisabledByTimeout; attempting to recreate CGEventTap. Allow Jitouch in System Preferences -> Privacy -> Accessibility.");
@@ -3209,11 +3273,9 @@ int eventTapTries = 0;
     if (newEventTap == nil) {
         if (logLevel >= LOG_LEVEL_DEBUG) NSLog(@"Could not create CGEventTap (try %d)", eventTapTries);
         eventTapTries++;
-        if (eventTapTries < 360) {
-            [NSTimer scheduledTimerWithTimeInterval:1.0 target:me selector:@selector(createEventTapTimer:) userInfo:nil repeats:NO];
-        } else {
-            NSLog(@"Could not create CGEventTap after 5 minutes. Perhaps try removing Jitouch permissions and relaunching Jitouch.");
-        }
+        // Keep trying for as long as it takes: Accessibility is often re-allowed long after launch, and a missing
+        // tap means drags get no pointer moves (log 16:04: moves=0 on every drag). ponytail: 1 s forever is cheap.
+        [NSTimer scheduledTimerWithTimeInterval:(eventTapTries < 360 ? 1.0 : 3.0) target:me selector:@selector(createEventTapTimer:) userInfo:nil repeats:NO];
     } else {
         NSLog(@"CGEventTap created");
         eventTap = newEventTap;
@@ -4224,10 +4286,11 @@ static void mmLogLine(const char *line) {
     struct stat st;
     FILE *f = fopen(path, (stat(path, &st) == 0 && st.st_size > 1024 * 1024) ? "w" : "a"); // ponytail: 1 MB cap, starts over
     if (!f) return;
-    time_t now = time(NULL);
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
     char ts[32];
-    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", localtime(&now));
-    fprintf(f, "%s %s\n", ts, line);
+    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", localtime(&tv.tv_sec));
+    fprintf(f, "%s.%03d %s\n", ts, (int)(tv.tv_usec / 1000), line);
     fclose(f);
 #endif
 }
@@ -4251,6 +4314,10 @@ static void mmEnd(int recognize) { // call with mmLock held
         float score = 0;
         if (mmStrokes == 1 && (letter = pdollarRecognize(mmPts, mmNPts, personalMaxScore, &score, 1))) {
             // matched your own trained handwriting closely: that wins over the built-in direction templates
+        } else if (mmStrokes == 1 && pdollarUserTemplateCount() > 0) {
+            // You've trained your letters, so a one-stroke drawing that matches none of them isn't a letter.
+            // (Jitouch's built-in shapes fired on casual scrolls: "Up-Left" and a one-stroke "F", log of 2026-11-10.)
+            why = "rejected-no-personal-match";
         } else if (mmStrokes == 1) {
             letter = finalizeStep(mmFirst[0], mmFirst[1], mmLast[0], mmLast[1], mmTop, mmBottom, mmLeft, mmRight);
             for (int i = 0; mmScrollLike[i]; i++)
@@ -4275,10 +4342,129 @@ static void mmEnd(int recognize) { // call with mmLock held
             [gestureWindow orderOut:nil];
         });
     }
+    mmShown = 0;
     cancelRecognition = 0;
     isMMFingerRecognizing = 0;
     mmStep = 0;
     mmGen++;
+}
+
+#ifdef JITOUCH_TEST
+static CGPoint jtTestPointer;
+#endif
+static CGPoint mmPointer(void) {
+#ifdef JITOUCH_TEST
+    return jtTestPointer;
+#endif
+    CGEventRef here = CGEventCreate(NULL);
+    CGPoint p = CGEventGetLocation(here);
+    CFRelease(here);
+    return p;
+}
+
+static void mmPost(CGEventType type, CGPoint at, CGMouseButton button, int clickState) {
+    CGEventRef e = CGEventCreateMouseEvent(NULL, type, at, button);
+    CGEventSetIntegerValueField(e, kCGMouseEventClickState, clickState);
+    CGEventSetIntegerValueField(e, kCGEventSourceUserData, mmSynthMark);
+    CGEventPost(kCGSessionEventTap, e);
+    CFRelease(e);
+}
+
+static void mmPostClick(CGEventType down, CGEventType up, CGMouseButton button, int clickState) {
+    CGPoint at = mmPointer();
+    mmPost(down, at, button, clickState);
+    mmPost(up, at, button, clickState);
+}
+
+static void mmRightClick(void) {
+#ifdef JITOUCH_TEST
+    jtTestRecognized = @"Right Click";
+    return;
+#endif
+    mmPostClick(kCGEventRightMouseDown, kCGEventRightMouseUp, kCGMouseButtonRight, 1);
+}
+
+static double mmLastClickT = -100; // touch time of the last single tap-click
+static int mmLeftClick(double downAt, double now) { // a tap that lands soon after the last tap-click is a double click
+    int state = downAt - mmLastClickT <= [NSEvent doubleClickInterval] ? 2 : 1;
+    mmLastClickT = state == 2 ? -100 : now;
+#ifdef JITOUCH_TEST
+    jtTestRecognized = state == 2 ? @"Double Click" : @"Click";
+    return state;
+#endif
+    mmPostClick(kCGEventLeftMouseDown, kCGEventLeftMouseUp, kCGMouseButtonLeft, state);
+    return state;
+}
+
+static void mmDragRelease(void) { // call with mmLock held
+    mmDragging = 0;
+    mmLastReleaseWall = CFAbsoluteTimeGetCurrent();
+    mmStep = 0;
+    char line[200];
+    snprintf(line, sizeof line, "drag: mouse up (moves=%llu wait avg=%.1fms max=%.1fms; mach-diff=%lld)", mmLatN,
+             mmLatN ? mmLatSumUp / 1e6 / mmLatN : 0.0, mmLatMaxUp / 1e6, mmLatMach0);
+    mmLogLine(line);
+    mmLatN = mmLatSumUp = mmLatMaxUp = 0;
+    mmHwPress = 0;
+#ifdef JITOUCH_TEST
+    jtTestRecognized = @"Drag released";
+#else
+    CGPoint now = mmPointer();
+    snprintf(line, sizeof line, "drag: up at lift=(%.0f,%.0f) pointer=(%.0f,%.0f) gap=%.0f px",
+             mmLiftPtr.x, mmLiftPtr.y, now.x, now.y, hypot(now.x - mmLiftPtr.x, now.y - mmLiftPtr.y));
+    mmLogLine(line);
+    mmPost(kCGEventLeftMouseUp, mmLiftPtr, kCGMouseButtonLeft, 1); // drop exactly where you let go
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+        CGPoint p = mmPointer(); // if this equals the lift point, posting the up moved the cursor
+        char l2[100];
+        snprintf(l2, sizeof l2, "drag: pointer 30 ms after up=(%.0f,%.0f)", p.x, p.y);
+        mmLogLine(l2);
+    });
+#endif
+}
+
+// A real button press took over during our drag: its own mouse-up ends the press, so post nothing.
+static void mmDragAbandon(void) { // call with mmLock held
+    mmDragging = 0;
+    mmStep = 0;
+    mmHwPress = 0;
+    mmLastReleaseWall = CFAbsoluteTimeGetCurrent();
+    mmLogLine("drag: real click took over");
+}
+
+// Let go of a finger-drag now (quit, SIGTERM, Jitouch turned off). Any thread; mmLock must NOT be held.
+void mmForceRelease(void) {
+    pthread_mutex_lock(&mmLock);
+    if (mmDragging) {
+        mmLiftPtr = mmPointer();
+        mmLogLine("drag: released because Jitouch is quitting or turned off");
+        mmDragRelease();
+    }
+    pthread_mutex_unlock(&mmLock);
+}
+
+// Frames can pause ~0.9 s with a finger still down (recorded-use-touches2.log 113.744 -> 114.618), and a 0.3 s
+// limit dropped a held drag (log 15:28:49). Every recorded lift sent a 0-finger frame, so this only needs to
+// catch a dead device (sleep, disconnect, Jitouch turned off): be patient.
+static void mmDragWatchdog(int gen) {
+#ifndef JITOUCH_TEST
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+        pthread_mutex_lock(&mmLock);
+        if (mmStep == 5 && mmDragging == 1 && gen == mmGen) {
+            if (mmHwPress) {
+                mmDragAbandon();
+            } else if (CFAbsoluteTimeGetCurrent() - mmLastFrameWall > 2.0) {
+                mmLiftPtr = mmPointer();
+                mmLogLine("drag: touch frames stopped, released");
+                mmDragRelease();
+            } else {
+                mmDragWatchdog(gen);
+            }
+        }
+        pthread_mutex_unlock(&mmLock);
+    });
+#endif
 }
 
 static void magicMouseFingerRecognizer(const Finger *data, int nFingers, double timestamp) {
@@ -4286,20 +4472,46 @@ static void magicMouseFingerRecognizer(const Finger *data, int nFingers, double 
     // raise mmAspect above 1 if wide letters (M, W) misrecognize. tapMoveMax = how far a "tap" may wander.
     static const float mmAspect = 1.0f;
     static const float tapMoveMax = 0.0008f; // measured deliberate taps moved at most 0.0003
-    // Timing measured from real use (2026-11-10 recordings): taps last 0.09-0.26 s and people put the finger
-    // back down 0.75-0.9 s after the tap, far slower than Jitouch's double-click speed (0.25 s).
-    static const double tapMaxHold = 0.35, drawGapMax = 1.2;
+    // A quick still touch is a click. Taps measured in real use last 0.09-0.29 s (logs of 2026-11-10).
+    static const double tapMaxHold = 0.35;
+    // Held still armTime..armMax, a touch arms a letter (a dot appears): draw without lifting. Still longer is a
+    // resting finger. ponytail: knobs; a rest that moves inside this window draws instead of scrolling.
+    static const double armTime = 0.5, armMax = 1.5;
+    // Tap, then touch again and move the mouse: a drag starts once the pointer moves dragPx (screen points).
+    // Arming a letter needs the pointer within pointerStill px, so normal mousing with a resting finger never arms.
+    static const CGFloat dragPx = 3, pointerStill = 4;
+    static const CGFloat tapDragPx = 8; // ponytail: knob; a tap's own pointer drift must stay a click
+    // How soon after a tap the finger must come back down to drag. Not the system double-click speed: yours is
+    // 0.15 s, and real re-touches after a tap measured 0.75-0.9 s. ponytail: knob; a touch that lands this soon
+    // after a tap and moves the mouse drags, so raise it only if drags still don't start.
+    static const double dragWindow = 0.6;
+    // One-touch drag: a finger lands on a still mouse, and the pointer moves dragPx within oneTouchWindow.
+    // ponytail: risky on purpose (a deliberate choice): normal mousing can match. Set oneTouchWindow 0 to turn it off.
+    // stillBefore: the pointer must not have moved this long before the finger landed. Off (0): real grabs land
+    // mid-sweep, 12-31 ms after the last pointer move (log of 2026-11-10), and a 100 ms guard refused them.
+    static const double oneTouchWindow = 0.3, stillBefore = 0; // 0.3: refusals at 240-242 ms (log 15:24)
+    static int oneTouchOK = 0;
+    static double preMoveGap; // how long the pointer had been still when the finger landed
+    static CGPoint touchPtr;
     static const float dst = 0.0002f;
 
-    static int lastN = 0, drawId = -1, tapClicked = 0;
-    static double tapStartWall, tapEndWall;
+    static int lastN = 0, drawId = -1, tapClicked = 0, moved = 0;
+    static double downT;
+    static double tapStartWall;
     static double t0, hintTime = -1;
     static float tapPos[2], lpos[2];
 
     pthread_mutex_lock(&mmLock);
+    mmLastFrameWall = CFAbsoluteTimeGetCurrent();
+    if (mmStep == 0) drawId = -1; // ids are reused: a finished drag's id must not exempt a resting thumb
 
     // A thumb or ring finger resting on the lower side edges (Jitouch's thumb zone, both sides) is part of
     // a normal grip, not a gesture, so it doesn't count. The drawing finger always counts, tracked by id.
+    // Two-finger tap = right click: exactly two fingers touch and lift within tapMaxHold, barely moving,
+    // with no mouse click and no scrolling (the same rules as the tap that starts a letter).
+    static int ttN, ttBad, ttIds[2];
+    static float ttPos[2][2];
+    static double ttStart, ttStartWall;
     const Finger *f = NULL;
     int nActive = 0;
     for (int i = 0; i < nFingers; i++) {
@@ -4308,9 +4520,27 @@ static void magicMouseFingerRecognizer(const Finger *data, int nFingers, double 
             nActive++;
             if (f == NULL || data[i].identifier == drawId)
                 f = &data[i];
+            if (lastN == 0 && nActive == 1) { ttN = 0; ttBad = mmButtonDown(); ttStart = timestamp; ttStartWall = CFAbsoluteTimeGetCurrent(); }
+            int j = 0;
+            while (j < ttN && ttIds[j] != data[i].identifier) j++;
+            if (j == ttN && ttN < 2) {
+                ttIds[ttN] = data[i].identifier;
+                ttPos[ttN][0] = data[i].px;
+                ttPos[ttN++][1] = data[i].py;
+            } else if (j == ttN || lenSqr(ttPos[j][0], ttPos[j][1], data[i].px, data[i].py) > tapMoveMax) {
+                ttBad = 1; // a third finger, or one moved
+            }
         }
     }
     nFingers = nActive;
+    if (nFingers > 0 && (timestamp - ttStart > tapMaxHold || mmButtonDown()))
+        ttBad = 1;
+    if (nFingers == 0 && lastN > 0 && ttN == 2) {
+        int clicked = mmStep == 5 || mmLastClickWall >= ttStartWall - 0.05, scrolling = mmLastScrollWall >= ttStartWall - scrollQuiet;
+        mmLogLine(ttBad || clicked || scrolling ? "two-finger-tap-refused" : "two-finger-tap: right click");
+        if (!ttBad && !clicked && !scrolling) mmRightClick();
+        ttN = 0;
+    }
     float x = f ? f->px * mmAspect : 0;
     float y = f ? f->py : 0;
 
@@ -4318,32 +4548,47 @@ static void magicMouseFingerRecognizer(const Finger *data, int nFingers, double 
         mmEnd(1);
 
     double wall = CFAbsoluteTimeGetCurrent();
+    int startDrag = 0;
     if (mmStep == 1 && mmButtonDown())
         tapClicked = 1;
 
-    if (mmStep == 1) { // first touch: must be a short tap that barely moves, with no click and no scrolling
+    if (mmStep == 1) { // first touch: a quick still tap clicks; held still, it arms a letter
+        int clicked = tapClicked || mmLastClickWall >= tapStartWall - 0.05;
+        int scrolling = mmLastScrollWall >= tapStartWall - scrollQuiet;
         if (nFingers == 0 && timestamp - t0 <= tapMaxHold) {
-            int clicked = tapClicked || mmLastClickWall >= tapStartWall - 0.05;
-            int scrolling = mmLastScrollWall >= tapStartWall - scrollQuiet;
 #ifdef JITOUCH_TRACE
             if (clicked || scrolling) printf("%.3f   not a tap: %s\n", timestamp, clicked ? "mouse click" : "scrolling");
 #endif
-            if (clicked || scrolling) // a still, short touch that would have been a tap: say why it wasn't
-                mmLogLine(clicked ? "tap-refused: the mouse button clicked" : "tap-refused: scrolling just before");
-            mmStep = (clicked || scrolling) ? 0 : 2;
-            t0 = timestamp;
-            tapEndWall = wall;
-        } else if (nFingers != 1 || timestamp - t0 > tapMaxHold || lenSqr(tapPos[0], tapPos[1], x, y) > tapMoveMax) {
-#ifdef JITOUCH_TRACE
-            printf("%.3f   not a tap: touches=%d held=%.3fs (max %.2f) moved2=%.4f (max %.4f)\n", timestamp, nFingers, timestamp - t0, tapMaxHold, lenSqr(tapPos[0], tapPos[1], x, y), tapMoveMax);
-#endif
+            mmLogLine(clicked ? "tap-refused: the mouse button clicked" : scrolling ? "tap-refused: scrolling just before" : "tap: click");
+            if (!clicked && !scrolling) mmLeftClick(t0, timestamp);
             mmStep = 0;
+        } else if (nFingers == 1 && !clicked && !scrolling && oneTouchOK && timestamp - t0 <= oneTouchWindow &&
+                   hypot(mmPointer().x - touchPtr.x, mmPointer().y - touchPtr.y) > tapDragPx) {
+            startDrag = 1; // landed on a still mouse, then the mouse moved right away
+        } else if (nFingers != 1 || clicked || scrolling || lenSqr(tapPos[0], tapPos[1], x, y) > tapMoveMax) {
+#ifdef JITOUCH_TRACE
+            printf("%.3f   not ours: touches=%d held=%.3fs moved2=%.4f (max %.4f)\n", timestamp, nFingers, timestamp - t0, lenSqr(tapPos[0], tapPos[1], x, y), tapMoveMax);
+#endif
+            mmStep = 0; // moved before arming (a scroll), another finger, or a click
+        } else if ((!oneTouchOK || timestamp - t0 > oneTouchWindow) &&
+                   hypot(mmPointer().x - touchPtr.x, mmPointer().y - touchPtr.y) > pointerStill) {
+            if (nFingers == 1 && !clicked && !scrolling) { // say why this wasn't a one-touch drag
+                char line[160];
+                if (!oneTouchOK)
+                    snprintf(line, sizeof line, "drag-refused: mouse was moving %.0f ms before the touch (needs %.0f)", preMoveGap * 1000, stillBefore * 1000);
+                else
+                    snprintf(line, sizeof line, "drag-refused: mouse started moving %.0f ms after the touch (max %.0f)", (timestamp - t0) * 1000, oneTouchWindow * 1000);
+                mmLogLine(line);
+            }
+            mmStep = 0; // the mouse is moving under a resting finger: normal mousing
+        } else if (timestamp - t0 >= armTime) {
+            mmLogLine("armed: draw now");
+            mmStep = 2; // the next frame starts the letter from where the finger sits
+            t0 = timestamp;
         }
-    } else if (mmStep == 2 || mmStep == 4) { // waiting for the first stroke (after the tap) or the next stroke
-        double wait = mmStep == 2 ? drawGapMax : strokeGap;
-        if (mmStep == 2 && (mmLastScrollWall > tapEndWall || mmLastClickWall > tapEndWall)) {
-            mmStep = 0; // scrolled (e.g. momentum) or clicked after the tap: not a gesture
-        } else if (mmStep == 4 && nFingers == 1 && timestamp - t0 <= mergeGap &&
+    } else if (mmStep == 2 || mmStep == 4) { // armed (finger still down) or waiting for the next stroke
+        double wait = mmStep == 2 ? 1.0 : strokeGap;
+        if (mmStep == 4 && nFingers == 1 && timestamp - t0 <= mergeGap &&
                    lenSqr(lpos[0], lpos[1], x, y) <= mergeDist * mergeDist) {
             // The finger slipped off for an instant and came back where it left: same stroke, carry on.
             mmStep = 3;
@@ -4351,7 +4596,7 @@ static void magicMouseFingerRecognizer(const Finger *data, int nFingers, double 
             drawId = f->identifier;
         } else if (nFingers == 1 && timestamp - t0 <= wait) {
             if (mmStep == 2) {
-                mmShown = 0;
+                moved = 0;
                 mmStrokes = 0;
                 mmNPts = 0;
                 isMMFingerRecognizing = 1; // blocks scroll and other mouse gestures while drawing
@@ -4359,6 +4604,14 @@ static void magicMouseFingerRecognizer(const Finger *data, int nFingers, double 
                 mmFirst[0] = mmLast[0] = x;
                 mmFirst[1] = mmLast[1] = y;
                 mmTop = 0; mmBottom = 1; mmLeft = 1; mmRight = 0;
+                mmShown = 1; // the dot that says "draw now"
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [gestureWindow setHintText: emptyString];
+                    [gestureWindow setUpWindowForMouseSurface];
+                    [gestureWindow display];
+                    [gestureWindow setLevel:NSScreenSaverWindowLevel];
+                    [gestureWindow makeKeyAndOrderFront:nil];
+                });
             } else {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [gestureWindow breakStroke];
@@ -4368,6 +4621,7 @@ static void magicMouseFingerRecognizer(const Finger *data, int nFingers, double 
             mmStep = 3;
             mmGen++; // cancels a pending end-of-letter timer
             mmStrokes++;
+            downT = timestamp;
             hintTime = -1;
             drawId = f->identifier;
             lpos[0] = x;
@@ -4377,14 +4631,48 @@ static void magicMouseFingerRecognizer(const Finger *data, int nFingers, double 
                 dispatch_async(dispatch_get_main_queue(), ^{ [gestureWindow addPointX:x Y:y]; });
         } else if (nFingers > 1) {
             mmEnd(0);
-        } else if (mmStep == 2 && (nFingers != 0 || timestamp - t0 > drawGapMax)) {
+        } else if (mmStep == 2) {
+            mmStep = 0; // lifted in the same instant it armed
+        }
+    } else if (mmStep == 6) { // touched again right after a tap-click: a double click, or a drag if the mouse moves
+        int clicked = mmLastClickWall >= tapStartWall - 0.05, scrolling = mmLastScrollWall >= tapStartWall - scrollQuiet;
+        if (nFingers == 0) {
+            if (timestamp - t0 <= tapMaxHold && !clicked && !scrolling)
+                mmLogLine(mmLeftClick(t0, timestamp) == 2 ? "tap: double click" : "tap: click (soon after a tap)");
+            else if (timestamp - t0 <= tapMaxHold)
+                mmLogLine(clicked ? "tap-refused: the mouse button clicked" : "tap-refused: scrolling just before");
             mmStep = 0;
+        } else if (nFingers != 1 || mmButtonDown()) {
+            mmStep = 0; // another finger, or a real click
+        } else if (hypot(mmPointer().x - touchPtr.x, mmPointer().y - touchPtr.y) > tapDragPx) {
+            startDrag = 1;
+        } else if (lenSqr(tapPos[0], tapPos[1], x, y) > tapMoveMax) {
+            mmStep = 0; // the finger slid while the mouse stayed put: a scroll
+        } else if (timestamp - t0 > tapMaxHold) {
+            mmStep = 1; // too long for a tap: carry on as a first touch, so it can still arm a letter
+        }
+    } else if (mmStep == 5) { // dragging: the button comes up the instant the drag finger lifts, where the cursor is.
+        // Posting the up at an older point snaps the cursor back there (log 16:04: released at (1725,135) with the
+        // cursor at (1922,139); 30 ms later the cursor was at (1737,135)). A finger that flickers back while the
+        // mouse moves starts a new one-touch drag, so a flicker is a drop plus an instant re-grab.
+        int dragDown = f && f->identifier == drawId; // the drag finger, by id: a second finger can't hold the button
+        if (mmHwPress) {
+            mmGen++;
+            mmDragAbandon();
+        } else if (!dragDown) {
+            mmLiftPtr = mmPointer();
+            mmGen++; // stops the watchdog
+            mmDragRelease();
+            drawId = -1;
         }
     } else if (mmStep == 3) { // drawing a stroke
-        if (nFingers == 0 && !cancelRecognition) { // finger lifted: wait for another stroke
-            if (!mmShown) {
-                mmStep = 0; // the finger never moved: a plain double tap, not a letter
-                isMMFingerRecognizing = 0;
+        if (mmStrokes == 1 && !moved && nFingers > 0 && timestamp - downT > armMax - armTime) {
+            mmLogLine("armed-timeout: resting finger");
+            mmEnd(0); // armed but never drew: a resting finger, not a letter
+            drawId = -1;
+        } else if (nFingers == 0 && !cancelRecognition) { // finger lifted: wait for another stroke
+            if (mmStrokes == 1 && !moved) {
+                mmEnd(0); // armed, then lifted without drawing: nothing
             } else {
                 mmStep = 4;
                 t0 = timestamp;
@@ -4416,18 +4704,7 @@ static void magicMouseFingerRecognizer(const Finger *data, int nFingers, double 
                     mmLast[1] = y;
                 }
                 if (mmNPts < MM_MAX_POINTS) mmPts[mmNPts++] = (PDPoint){x * pdollarAspectX, y, mmStrokes};
-                if (!mmShown) { // show the ink only once the finger moves, so a plain double tap stays invisible
-                    mmShown = 1;
-                    float fx = mmPts[0].x / pdollarAspectX, fy = mmPts[0].y;
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [gestureWindow setHintText: emptyString];
-                        [gestureWindow setUpWindowForMouseSurface];
-                        [gestureWindow addPointX:fx Y:fy];
-                        [gestureWindow display];
-                        [gestureWindow setLevel:NSScreenSaverWindowLevel];
-                        [gestureWindow makeKeyAndOrderFront:nil];
-                    });
-                }
+                moved = 1;
                 lpos[0] = x;
                 lpos[1] = y;
                 dispatch_async(dispatch_get_main_queue(), ^{
@@ -4445,14 +4722,36 @@ static void magicMouseFingerRecognizer(const Finger *data, int nFingers, double 
         }
     }
 
+    if (startDrag) { // press the button where the finger landed, then catch up to the pointer
+        mmStep = 5;
+        drawId = f->identifier;
+        mmLastClickT = -100;
+        mmHwPress = 0;
+#ifdef JITOUCH_TEST
+        jtTestRecognized = @"Drag";
+#else
+        // Press where the pointer is now: posting at the older touch point yanks the real cursor back there.
+        mmPost(kCGEventLeftMouseDown, mmPointer(), kCGMouseButtonLeft, 1);
+#endif
+        mmDragging = 1; // only after the press is out, so no drag move can precede it
+        { char line[120];
+          snprintf(line, sizeof line, "drag: mouse down (mouse still %.0f ms before the touch)", preMoveGap * 1000);
+          mmLogLine(line); }
+        mmDragWatchdog(mmGen);
+    }
+
 #ifdef JITOUCH_TRACE
     { static int ps = 0; if (mmStep != ps) printf("%.3f step %d -> %d  touches=%d at (%.2f,%.2f) strokes=%d\n", timestamp, ps, mmStep, nFingers, x, y, mmStrokes); ps = mmStep; }
 #endif
     if (mmStep == 0 && lastN == 0 && nFingers == 1) { // a fresh touch starts a possible tap
-        mmStep = 1;
+        mmStep = timestamp - mmLastClickT <= dragWindow ? 6 : 1; // 6: right after a tap-click
         t0 = timestamp;
         tapStartWall = wall;
         tapClicked = mmButtonDown();
+        drawId = f->identifier; // keep counting this finger if it slides into the side zone
+        touchPtr = mmPointer();
+        preMoveGap = wall - mmLastMoveWall;
+        oneTouchOK = preMoveGap >= stillBefore;
         tapPos[0] = x;
         tapPos[1] = y;
     }

@@ -31,5 +31,12 @@ int main(int argc, const char * argv[])
     // set the breakpoint to automatically continue after evaluating actions.
     signal(SIGHUP, SIG_IGN);
 
+    // SIGTERM (killall, launchctl, the prefpane restarting Jitouch): quit normally, so applicationWillTerminate
+    // releases a finger-drag that is holding the left button.
+    dispatch_source_t term = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0, dispatch_get_main_queue());
+    dispatch_source_set_event_handler(term, ^{ [NSApp terminate:nil]; });
+    dispatch_resume(term);
+    signal(SIGTERM, SIG_IGN);
+
     return NSApplicationMain(argc, argv);
 }

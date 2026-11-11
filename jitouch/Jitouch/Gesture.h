@@ -16,3 +16,4 @@
 @end
 
 void turnOffGestures(void);
+void mmForceRelease(void);

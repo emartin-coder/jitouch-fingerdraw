@@ -142,6 +142,12 @@ CGKeyCode keyMap[128]; // for dvorak support
 
     if (!enAll)
         turnOffGestures();
+    else if (!enMMAll || !enCharRegMM)
+        mmForceRelease(); // Magic Mouse finger gestures just turned off: don't leave a drag holding the button
+}
+
+- (void)applicationWillTerminate:(NSNotification *)notification {
+    mmForceRelease(); // quitting mid-drag must not leave the left button held
 }
 
 #pragma mark - Initialization

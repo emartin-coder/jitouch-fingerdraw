@@ -142,9 +142,24 @@ static void loadUserTemplates(void) {
     }
 }
 
+static dispatch_once_t loadOnce;
+static void loadTemplates(void);
+static const char *pdollarMatch(const PDPoint *pts, int n, float maxScore, float *score, int userOnly);
+
+int pdollarUserTemplateCount(void) {
+    loadTemplates();
+    return nTemplates - N_BUILTIN;
+}
+
 const char *pdollarRecognize(const PDPoint *pts, int n, float maxScore, float *score, int userOnly) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
+    loadTemplates();
+    *score = FLT_MAX;
+    if (n < 2) return NULL;
+    return pdollarMatch(pts, n, maxScore, score, userOnly);
+}
+
+static void loadTemplates(void) {
+    dispatch_once(&loadOnce, ^{
         for (int t = 0; t < N_BUILTIN; t++) {
             templates[t].name = sources[t].name;
             templates[t].multi = isMultiStroke(sources[t].pts, sources[t].n);
@@ -154,8 +169,9 @@ const char *pdollarRecognize(const PDPoint *pts, int n, float maxScore, float *s
         nTemplates = N_BUILTIN;
         loadUserTemplates();
     });
-    *score = FLT_MAX;
-    if (n < 2) return NULL;
+}
+
+static const char *pdollarMatch(const PDPoint *pts, int n, float maxScore, float *score, int userOnly) {
     // Like with like: you write Y in two strokes, so a single stroke (a scroll, a piece of an F) is never a Y.
     int multi = isMultiStroke(pts, n);
     PDPoint cand[PD_N];
